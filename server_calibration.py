@@ -485,6 +485,7 @@ def generate_weak_class_features(
     device: str,
     weak_percentile: float = 0.0,
     use_refiner: bool = True,   # False → 仅高斯采样，不使用 refiner（proto_aug 用）
+    feature_generator=None,
 ) -> tuple:
     """
     为客户端的弱类/缺失类生成合成特征，用于本地训练数据增强。
@@ -529,10 +530,13 @@ def generate_weak_class_features(
     if len(weak_protos) == 0:
         return torch.empty(0, dtype=torch.float32), torch.empty(0, dtype=torch.long)
 
-    # 生成合成特征（每个弱类总计生成 aug_gen_per_class 个样本，按全局原型簇分摊）
-    aug_feats, aug_labels = generate_calibration_features(
-        refiner if use_refiner else None, weak_protos, num_classes,
-        aug_gen_per_class, proposal_sigma, device, use_refiner=use_refiner)
+    if feature_generator is None:
+        # 每个弱类总计生成 aug_gen_per_class 个样本，按全局原型簇分摊。
+        aug_feats, aug_labels = generate_calibration_features(
+            refiner if use_refiner else None, weak_protos, num_classes,
+            aug_gen_per_class, proposal_sigma, device, use_refiner=use_refiner)
+    else:
+        aug_feats, aug_labels = feature_generator(weak_protos)
 
     return aug_feats, aug_labels  # already on CPU
 

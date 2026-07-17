@@ -7,6 +7,7 @@ FedProRef: Data utilities
 """
 import os
 import time
+import glob
 import zipfile
 import urllib.request
 import numpy as np
@@ -384,6 +385,79 @@ def _load_feature_cache(cache_file, args):
     return client_data, test_features, test_labels
 
 
+def _load_global_feature_cache(cache_file):
+    """Load partition-independent frozen features from a global cache."""
+    print(f"Loading global cached features from {cache_file}")
+    data = np.load(cache_file, allow_pickle=True)
+    return (
+        data["train_features"],
+        data["train_labels"],
+        data["test_features"],
+        data["test_labels"],
+    )
+
+
+def _partition_cache_path(cache_dir, args, partition_seed):
+    partition_dir = os.path.join(cache_dir, "partitions")
+    os.makedirs(partition_dir, exist_ok=True)
+    alpha_tag = str(args.alpha).replace("/", "_")
+    return os.path.join(
+        partition_dir,
+        f"{args.dataset}_alpha{alpha_tag}_c{args.num_clients}_"
+        f"min{args.min_require_size}_ps{partition_seed}.npz",
+    )
+
+
+def _save_partition_cache(cache_file, client_indices):
+    """Save only client-to-global-feature index mappings (no feature copies)."""
+    payload = {
+        f"client_{k}": np.asarray(indices, dtype=np.int64)
+        for k, indices in enumerate(client_indices)
+    }
+    payload["num_clients"] = np.asarray([len(client_indices)], dtype=np.int64)
+    tmp_cache_file = f"{cache_file}.tmp.{os.getpid()}.npz"
+    np.savez(tmp_cache_file, **payload)
+    os.replace(tmp_cache_file, cache_file)
+
+
+def _load_partition_cache(cache_file, expected_num_clients):
+    print(f"Loading cached partition indices from {cache_file}")
+    data = np.load(cache_file, allow_pickle=False)
+    stored_num_clients = int(np.asarray(data["num_clients"]).reshape(-1)[0])
+    if stored_num_clients != expected_num_clients:
+        raise ValueError(
+            f"Partition cache {cache_file} has {stored_num_clients} clients; "
+            f"expected {expected_num_clients}")
+    return [
+        np.asarray(data[f"client_{k}"], dtype=np.int64)
+        for k in range(stored_num_clients)
+    ]
+
+
+def _combined_cache_paths(cache_dir, args, pretrained_tag, partition_seed):
+    """Return current/legacy combined caches, preferring the exact partition."""
+    backbone_tag = args.backbone.replace("/", "_")
+    exact = [
+        os.path.join(
+            cache_dir,
+            f"{backbone_tag}_{pretrained_tag}_alpha{args.alpha}_"
+            f"c{args.num_clients}_ps{partition_seed}.npz"),
+        os.path.join(
+            cache_dir,
+            f"{backbone_tag}_{pretrained_tag}_alpha{args.alpha}_"
+            f"c{args.num_clients}_s{partition_seed}.npz"),
+    ]
+    pattern = os.path.join(cache_dir, f"{backbone_tag}_{pretrained_tag}_alpha*_c*_*.npz")
+    return list(dict.fromkeys(exact + sorted(glob.glob(pattern))))
+
+
+def _client_data_from_indices(train_features, train_labels, client_indices):
+    return [
+        (train_features[indices], train_labels[indices])
+        for indices in client_indices
+    ]
+
+
 def _acquire_cache_lock(cache_file):
     lock_file = f"{cache_file}.lock"
     while True:
@@ -402,7 +476,7 @@ def _release_cache_lock(lock_file, fd):
     except FileNotFoundError:
         pass
 
-def get_or_extract_features(args):
+def _get_or_extract_seed_dependent_features(args):
     """
     Load cached features or extract them. Returns:
         client_data: list of (features_np, labels_np) per client
@@ -421,11 +495,15 @@ def get_or_extract_features(args):
         cache_file = legacy_cache_file
 
     if os.path.exists(cache_file):
+        args.feature_cache_file = cache_file
+        args.partition_cache_file = cache_file
         return _load_feature_cache(cache_file, args)
 
     lock_file, lock_fd = _acquire_cache_lock(cache_file)
     try:
         if os.path.exists(cache_file):
+            args.feature_cache_file = cache_file
+            args.partition_cache_file = cache_file
             return _load_feature_cache(cache_file, args)
 
         print("Extracting CLIP features (this may take a while)...")
@@ -466,6 +544,8 @@ def get_or_extract_features(args):
                  test_domain_ids=(test_domain_ids if test_domain_ids is not None else np.array([], dtype=np.int64)),
                  test_domain_names=np.array(test_domain_names or [], dtype=object))
         os.replace(tmp_cache_file, cache_file)
+        args.feature_cache_file = cache_file
+        args.partition_cache_file = cache_file
 
         # Print distribution
         print("\nClient data distribution:")
@@ -485,3 +565,129 @@ def get_or_extract_features(args):
         _release_cache_lock(lock_file, lock_fd)
 
     return client_data, test_features, test_labels_t
+
+
+def get_or_extract_features(args):
+    """
+    Load frozen features and apply a partition-specific index view.
+
+    CIFAR/TinyImageNet features are independent of the Dirichlet partition, so
+    they are stored once globally. PACS/OfficeHome retain a seed-dependent
+    combined cache because their train/test image split itself depends on the
+    partition seed.
+    """
+    if is_multi_domain_dataset(args.dataset):
+        return _get_or_extract_seed_dependent_features(args)
+
+    cache_dir = os.path.join(args.data_dir, f"{args.dataset}_clip_cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    pretrained_tag = os.path.basename(args.pretrained).replace(" ", "_")
+    backbone_tag = args.backbone.replace("/", "_")
+    partition_seed = getattr(args, "partition_seed", args.seed)
+    global_cache_file = os.path.join(
+        cache_dir, f"{backbone_tag}_{pretrained_tag}_global_features.npz")
+    combined_candidates = _combined_cache_paths(
+        cache_dir, args, pretrained_tag, partition_seed)
+
+    if not os.path.exists(global_cache_file):
+        lock_file, lock_fd = _acquire_cache_lock(global_cache_file)
+        try:
+            if not os.path.exists(global_cache_file):
+                legacy_source = next(
+                    (path for path in combined_candidates if os.path.exists(path)),
+                    None)
+                if legacy_source is not None:
+                    # A hard link promotes an existing combined cache without
+                    # copying its large feature tensors. Extra legacy index
+                    # fields are ignored by the global-cache loader.
+                    print(
+                        f"Promoting existing feature cache to global cache: "
+                        f"{legacy_source}")
+                    try:
+                        os.link(legacy_source, global_cache_file)
+                    except FileExistsError:
+                        pass
+                else:
+                    print("Extracting global CLIP features (this may take a while)...")
+                    raw_data = load_raw_dataset(
+                        args.dataset, args.data_dir, args.alpha, partition_seed)
+                    if len(raw_data) != 4:
+                        raise ValueError(
+                            f"Expected a partition-independent dataset, got "
+                            f"{len(raw_data)} fields for {args.dataset}")
+                    train_images, train_labels, test_images, test_labels_np = raw_data
+                    train_features = extract_clip_features(
+                        train_images, args.backbone, args.pretrained, args.device)
+                    test_features_np = extract_clip_features(
+                        test_images, args.backbone, args.pretrained, args.device)
+                    tmp_cache_file = (
+                        f"{global_cache_file}.tmp.{os.getpid()}.npz")
+                    np.savez(
+                        tmp_cache_file,
+                        train_features=train_features,
+                        train_labels=train_labels,
+                        test_features=test_features_np,
+                        test_labels=test_labels_np,
+                    )
+                    os.replace(tmp_cache_file, global_cache_file)
+        finally:
+            _release_cache_lock(lock_file, lock_fd)
+
+    train_features, train_labels, test_features_np, test_labels_np = (
+        _load_global_feature_cache(global_cache_file))
+    args.feature_cache_file = global_cache_file
+    args.test_domain_ids = None
+    args.test_domain_names = None
+
+    partition_cache_file = _partition_cache_path(
+        cache_dir, args, partition_seed)
+    if not os.path.exists(partition_cache_file):
+        lock_file, lock_fd = _acquire_cache_lock(partition_cache_file)
+        try:
+            if not os.path.exists(partition_cache_file):
+                # Only the two exact current/legacy paths may provide indices
+                # for this partition. Other combined caches are valid feature
+                # sources but belong to different partition configurations.
+                exact_partition_sources = combined_candidates[:2]
+                legacy_partition_source = next(
+                    (path for path in exact_partition_sources
+                     if os.path.exists(path)),
+                    None)
+                client_indices = None
+                if legacy_partition_source is not None:
+                    legacy_data = np.load(
+                        legacy_partition_source, allow_pickle=True)
+                    if "client_indices" in legacy_data:
+                        client_indices = [
+                            np.asarray(indices, dtype=np.int64)
+                            for indices in legacy_data["client_indices"]
+                        ]
+                        print(
+                            f"Migrating partition indices from "
+                            f"{legacy_partition_source}")
+
+                expected_indices = dirichlet_partition(
+                    train_labels, args.num_clients, args.alpha,
+                    args.num_classes, args.min_require_size,
+                    partition_seed)
+                if client_indices is None or any(
+                    not np.array_equal(old, expected)
+                    for old, expected in zip(client_indices, expected_indices)
+                ) or len(client_indices) != len(expected_indices):
+                    if client_indices is not None:
+                        print(
+                            "Legacy partition indices do not match the current "
+                            "partition configuration; regenerating indices.")
+                    client_indices = expected_indices
+                _save_partition_cache(partition_cache_file, client_indices)
+        finally:
+            _release_cache_lock(lock_file, lock_fd)
+
+    client_indices = _load_partition_cache(
+        partition_cache_file, args.num_clients)
+    args.partition_cache_file = partition_cache_file
+    client_data = _client_data_from_indices(
+        train_features, train_labels, client_indices)
+    test_features = torch.from_numpy(test_features_np).float()
+    test_labels = torch.from_numpy(test_labels_np).long()
+    return client_data, test_features, test_labels

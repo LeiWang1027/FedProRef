@@ -4,6 +4,21 @@ Sample initial z_0 from prototype mixture + noise.
 """
 import torch
 import torch.nn.functional as F
+def sample_count_weighted_anchor_indices(
+    counts: torch.Tensor,
+    num_samples: int,
+    generator: torch.Generator | None = None,
+) -> torch.Tensor:
+    """Sample anchor indices with the repository's count-proportional rule."""
+    if counts.ndim != 1 or counts.numel() == 0:
+        raise ValueError("counts must be a non-empty one-dimensional tensor")
+    if num_samples < 0:
+        raise ValueError("num_samples must be non-negative")
+    weights = counts.to(dtype=torch.float32)
+    if torch.any(weights < 0) or weights.sum() <= 0:
+        raise ValueError("anchor counts must have positive total mass")
+    return torch.multinomial(
+        weights / weights.sum(), num_samples, replacement=True, generator=generator)
 
 
 def sample_proposal(prototypes_and_counts: list, num_samples: int,
@@ -26,10 +41,9 @@ def sample_proposal(prototypes_and_counts: list, num_samples: int,
     mus = torch.stack([p[0] for p in prototypes_and_counts]).to(device)  # (K, d)
     weights = torch.tensor([p[1] for p in prototypes_and_counts],
                            dtype=torch.float32, device=device)
-    weights = weights / weights.sum()
 
     # Sample which prototype each sample comes from
-    indices = torch.multinomial(weights, num_samples, replacement=True)  # (num_samples,)
+    indices = sample_count_weighted_anchor_indices(weights, num_samples)  # (num_samples,)
 
     # Get base positions
     z0 = mus[indices]  # (num_samples, d)

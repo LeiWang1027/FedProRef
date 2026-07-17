@@ -68,8 +68,8 @@ parser.add_argument(
     "--method",
     type=str,
     default="fedproref",
-    choices=["fedavg", "proto_aug", "proto_cal", "proto_sample", "fedproref"],
-    help="临时覆盖训练方法: fedavg | proto_aug | proto_cal | proto_sample | fedproref"
+    choices=["fedavg", "proto_aug", "proto_cal", "proto_sample", "fedproref", "direct_anchor_aug"],
+    help="临时覆盖训练方法: fedavg | proto_aug | proto_cal | proto_sample | fedproref | direct_anchor_aug"
 )
 parser.add_argument(
     "--pretrained",

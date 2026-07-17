@@ -1,0 +1,34 @@
+# Matched internal ablation; this file is declarative because this repository
+# currently uses argparse rather than a YAML loader.
+display_name: DirectAnchorAug
+method: direct_anchor_aug
+synthetic_feature_mode: direct_anchor
+use_proposal_noise: false
+use_refiner: false
+proposal_sigma: null
+
+# Current Table-3-style matched defaults from train_plan_cifar_tiny.sh.
+dataset: cifar100
+data_dir: ./data
+backbone: ViT-B-16
+pretrained: ./pretrain_path/old_open_clip_model.safetensors
+feat_dim: 512
+total_clients: 10
+selected_clients: 10
+rounds: 100
+local_epochs: 10
+batch_size: 64
+lr: 0.001
+head_type: linear
+prototype_merge: true
+proto_merge_threshold: 0.90
+num_modes: 1
+num_aug_per_class: 100
+aug_gen_per_class: 100
+n_min: 10
+min_samples_per_class: 10
+tau: 10
+q: 0.10
+weak_class_percentile: 10.0
+partition_seed: 42
+training_seed: 42

@@ -111,6 +111,12 @@ def get_args():
     parser.add_argument("--weak_class_percentile", type=float, default=0.0,
                         help="Bottom X%% of classes (by sample count) are also treated as weak. "
                              "0=disabled. E.g. 20 means the 20%% least-represented classes trigger synthesis.")
+    parser.add_argument("--mechanism_eval_start_round", type=int, default=1,
+                        help="First round (inclusive) for local weak-class mechanism evaluation")
+    parser.add_argument("--mechanism_eval_end_round", type=int, default=0,
+                        help="Last round (inclusive) for mechanism evaluation; 0 uses comm_rounds")
+    parser.add_argument("--mechanism_save_per_class", action="store_true",
+                        help="Save per-class before/after recall vectors in mechanism artifacts")
 
 
     parser.add_argument("--cal_budget", type=int, default=500,
@@ -120,7 +126,7 @@ def get_args():
 
     # ── Method ablation switches ─────────────────────────────────────
     parser.add_argument("--method", type=str, default="fedproref",
-                        choices=["fedavg", "proto_aug", "proto_cal", "proto_sample", "fedproref"],
+                        choices=["fedavg", "proto_aug", "proto_cal", "proto_sample", "fedproref", "direct_anchor_aug"],
                         help="Which method to run (for ablation)")
 
     # ── Misc ─────────────────────────────────────────────────────────
@@ -133,6 +139,14 @@ def get_args():
     parser.add_argument("--exp_name", type=str, default="default")
 
     args = parser.parse_args()
+    if args.mechanism_eval_start_round < 1:
+        parser.error("--mechanism_eval_start_round must be >= 1")
+    mechanism_end = args.mechanism_eval_end_round or args.comm_rounds
+    if mechanism_end < args.mechanism_eval_start_round:
+        parser.error("mechanism evaluation end round must be >= start round")
+    if mechanism_end > args.comm_rounds:
+        parser.error("mechanism evaluation end round cannot exceed comm_rounds")
+
 
 
     if args.device == "auto":
