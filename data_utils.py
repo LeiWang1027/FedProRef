@@ -5,15 +5,21 @@ FedProRef: Data utilities
 - PACS/OfficeHome multi-domain loading following the GGEUR one-domain-one-client setup
 - CLIP feature extraction (cached to disk)
 """
+import json
 import os
 import time
-import glob
 import zipfile
 import urllib.request
 import numpy as np
 import torch
 from torch.utils.data import Dataset
 from torchvision import datasets, transforms
+
+from backbone_utils import (
+    open_clip_load_kwargs,
+    resolve_feature_dim,
+    resolve_pretrained_identity,
+)
 
 
 MULTI_DOMAIN_SPECS = {
@@ -274,60 +280,101 @@ def load_raw_dataset(dataset_name: str, data_dir: str, alpha: float = 0.1, seed:
 # ── Dirichlet partition ──────────────────────────────────────────────
 
 def dirichlet_partition(labels: np.ndarray, num_clients: int, alpha: float,
-                        num_classes: int, min_require_size: int = 2, seed: int = 42):
+                        num_classes: int, min_require_size: int = 0,
+                        seed: int = 42,
+                        max_attempts: int = 50):
     """
     Partition dataset indices into `num_clients` using Dirichlet distribution.
+    For floor-zero partitions, empty clients are repaired deterministically by
+    moving one sample from the largest donor client after sampling attempts are
+    exhausted. This keeps client-class cells free to remain empty.
     Returns: list of np.ndarray (one per client) with indices into `labels`.
     """
+    if num_clients <= 0:
+        raise ValueError("num_clients must be positive")
+    if alpha <= 0:
+        raise ValueError("alpha must be positive")
+    if min_require_size < 0:
+        raise ValueError("min_require_size must be nonnegative")
+    if len(labels) < num_clients:
+        raise ValueError(
+            "dataset must contain at least one sample per client")
+    if max_attempts <= 0:
+        raise ValueError("max_attempts must be positive")
+
     rng = np.random.RandomState(seed)
-    n = len(labels)
-    client_indices = [[] for _ in range(num_clients)]
+    indices_by_class = [np.where(labels == c)[0] for c in range(num_classes)]
 
-    class_indices = [np.where(labels == c)[0] for c in range(num_classes)]
-    for c in range(num_classes):
-        rng.shuffle(class_indices[c])
+    if min_require_size > 0:
+        required_per_class = num_clients * min_require_size
+        client_indices = [[] for _ in range(num_clients)]
+        for class_id, idx_c in enumerate(indices_by_class):
+            if len(idx_c) < required_per_class:
+                raise ValueError(
+                    f"class {class_id} has {len(idx_c)} samples, but "
+                    f"min_require_size={min_require_size} with {num_clients} "
+                    f"clients requires {required_per_class}")
 
-    # Guarantee minimum samples per client per class
-    for c in range(num_classes):
-        idx_c = class_indices[c]
-        alloc = min(min_require_size * num_clients, len(idx_c))
-        for k in range(num_clients):
-            start = k * min_require_size
-            end = min((k + 1) * min_require_size, alloc)
-            if start < end:
-                client_indices[k].extend(idx_c[start:end].tolist())
-        class_indices[c] = idx_c[alloc:]
+            shuffled = rng.permutation(idx_c)
+            seeded = shuffled[:required_per_class]
+            for client_id in range(num_clients):
+                start = client_id * min_require_size
+                stop = start + min_require_size
+                client_indices[client_id].extend(seeded[start:stop].tolist())
 
-    # Distribute remaining using Dirichlet
-    for c in range(num_classes):
-        idx_c = class_indices[c]
-        if len(idx_c) == 0:
-            continue
-        proportions = rng.dirichlet(np.repeat(alpha, num_clients))
-        counts = (proportions * len(idx_c)).astype(int)
-        counts[-1] = len(idx_c) - counts[:-1].sum()
-        counts = np.clip(counts, 0, len(idx_c))
-        # Fix rounding
-        diff = len(idx_c) - counts.sum()
-        if diff > 0:
-            counts[rng.randint(num_clients)] += diff
-        elif diff < 0:
-            for _ in range(-diff):
-                j = rng.choice(np.where(counts > 0)[0])
-                counts[j] -= 1
+            remaining = shuffled[required_per_class:]
+            if len(remaining) > 0:
+                proportions = rng.dirichlet(np.repeat(alpha, num_clients))
+                counts = rng.multinomial(len(remaining), proportions)
+                splits = np.split(remaining, np.cumsum(counts[:-1]))
+                for client_id, client_split in enumerate(splits):
+                    client_indices[client_id].extend(client_split.tolist())
 
-        split = np.split(idx_c[:counts.sum()], np.cumsum(counts[:-1]))
-        for k in range(num_clients):
-            client_indices[k].extend(split[k].tolist())
+        finalized = []
+        for indices in client_indices:
+            shuffled_client = np.asarray(indices, dtype=np.int64)
+            rng.shuffle(shuffled_client)
+            finalized.append(shuffled_client)
+        return finalized
 
-    client_indices = [np.asarray(ci, dtype=np.int64) for ci in client_indices]
-    return client_indices
+    for _ in range(max_attempts):
+        client_indices = [[] for _ in range(num_clients)]
+
+        for idx_c in indices_by_class:
+            if len(idx_c) == 0:
+                continue
+            shuffled = rng.permutation(idx_c)
+            proportions = rng.dirichlet(np.repeat(alpha, num_clients))
+            counts = rng.multinomial(len(shuffled), proportions)
+            split = np.split(shuffled, np.cumsum(counts[:-1]))
+            for client_id, client_split in enumerate(split):
+                client_indices[client_id].extend(client_split.tolist())
+
+        if all(client_indices):
+            return [np.asarray(ci, dtype=np.int64) for ci in client_indices]
+
+    empty_clients = [
+        client_id for client_id, indices in enumerate(client_indices)
+        if not indices
+    ]
+    for empty_client in empty_clients:
+        donor = max(
+            (client_id for client_id, indices in enumerate(client_indices)
+             if len(indices) > 1),
+            key=lambda client_id: (len(client_indices[client_id]), -client_id),
+        )
+        moved_offset = int(rng.randint(len(client_indices[donor])))
+        client_indices[empty_client].append(
+            client_indices[donor].pop(moved_offset))
+
+    return [np.asarray(ci, dtype=np.int64) for ci in client_indices]
 
 
 # ── CLIP feature extraction ─────────────────────────────────────────
 
 def extract_clip_features(images: np.ndarray, backbone: str, pretrained: str,
-                          device: str, batch_size: int = 256):
+                          device: str, batch_size: int = 256,
+                          identity: dict | None = None):
     """
     Extract L2-normalized CLIP features from uint8 images.
     Returns: np.ndarray of shape (N, feat_dim).
@@ -335,7 +382,9 @@ def extract_clip_features(images: np.ndarray, backbone: str, pretrained: str,
     import open_clip
     from PIL import Image as PILImage
 
-    model, _, preprocess = open_clip.create_model_and_transforms(backbone, pretrained=pretrained)
+    identity = identity or resolve_pretrained_identity(backbone, pretrained)
+    model, _, preprocess = open_clip.create_model_and_transforms(
+        backbone, pretrained=pretrained, **open_clip_load_kwargs(identity))
     model = model.eval().to(device)
 
     all_features = []
@@ -364,98 +413,68 @@ def extract_clip_features(images: np.ndarray, backbone: str, pretrained: str,
     return np.concatenate(all_features, axis=0)
 
 
-def _load_feature_cache(cache_file, args):
+def _partition_scheme(args) -> str:
+    if is_multi_domain_dataset(args.dataset):
+        return "multidomain-v1"
+    return "partition-nonempty-v4"
+
+
+def _expected_cache_metadata(args, identity) -> dict:
+    return {
+        "dataset": args.dataset,
+        "backbone": identity["backbone"],
+        "checkpoint_hash": identity["checkpoint_hash"],
+        "alpha": float(args.alpha),
+        "num_clients": int(args.num_clients),
+        "partition_seed": int(getattr(args, "partition_seed", args.seed)),
+        "min_require_size": int(getattr(args, "min_require_size", 0)),
+        "partition_scheme": _partition_scheme(args),
+    }
+
+
+def _load_feature_cache(cache_file, args, identity=None):
     print(f"Loading cached features from {cache_file}")
-    data = np.load(cache_file, allow_pickle=True)
-    test_features = torch.from_numpy(data["test_features"]).float()
-    test_labels = torch.from_numpy(data["test_labels"]).long()
-    client_indices = data["client_indices"]  # object array
-    train_features = data["train_features"]
-    train_labels = data["train_labels"]
-    if "test_domain_ids" in data and "test_domain_names" in data:
-        args.test_domain_ids = torch.from_numpy(data["test_domain_ids"]).long()
-        args.test_domain_names = [str(x) for x in data["test_domain_names"].tolist()]
-    else:
-        args.test_domain_ids = None
-        args.test_domain_names = None
+    identity = identity or resolve_pretrained_identity(args.backbone, args.pretrained)
+    with np.load(cache_file, allow_pickle=True) as data:
+        if "metadata" not in data:
+            raise ValueError(f"feature cache has no metadata: {cache_file}")
+        metadata = json.loads(str(data["metadata"].item()))
+        expected = _expected_cache_metadata(args, identity)
+        for key, expected_value in expected.items():
+            if metadata.get(key) != expected_value:
+                raise ValueError(
+                    f"feature cache metadata mismatch for {key}: "
+                    f"stored={metadata.get(key)!r}, expected={expected_value!r}")
+
+        train_features = np.asarray(data["train_features"])
+        train_labels = np.asarray(data["train_labels"])
+        test_features_np = np.asarray(data["test_features"])
+        test_labels_np = np.asarray(data["test_labels"])
+        client_indices = data["client_indices"].copy()
+        resolved_dim = resolve_feature_dim(None, train_features, test_features_np)
+        if metadata.get("feature_dim") != resolved_dim:
+            raise ValueError(
+                f"feature cache metadata mismatch for feature_dim: "
+                f"stored={metadata.get('feature_dim')!r}, resolved={resolved_dim}")
+
+        if "test_domain_ids" in data and "test_domain_names" in data:
+            args.test_domain_ids = torch.from_numpy(
+                np.asarray(data["test_domain_ids"])).long()
+            args.test_domain_names = [
+                str(x) for x in data["test_domain_names"].tolist()]
+        else:
+            args.test_domain_ids = None
+            args.test_domain_names = None
+
+    args.feature_cache_file = os.path.realpath(cache_file)
+    args.backbone_identity = metadata
+    test_features = torch.from_numpy(test_features_np).float()
+    test_labels = torch.from_numpy(test_labels_np).long()
     client_data = []
     for ci in client_indices:
         ci = np.asarray(ci, dtype=np.int64)
         client_data.append((train_features[ci], train_labels[ci]))
     return client_data, test_features, test_labels
-
-
-def _load_global_feature_cache(cache_file):
-    """Load partition-independent frozen features from a global cache."""
-    print(f"Loading global cached features from {cache_file}")
-    data = np.load(cache_file, allow_pickle=True)
-    return (
-        data["train_features"],
-        data["train_labels"],
-        data["test_features"],
-        data["test_labels"],
-    )
-
-
-def _partition_cache_path(cache_dir, args, partition_seed):
-    partition_dir = os.path.join(cache_dir, "partitions")
-    os.makedirs(partition_dir, exist_ok=True)
-    alpha_tag = str(args.alpha).replace("/", "_")
-    return os.path.join(
-        partition_dir,
-        f"{args.dataset}_alpha{alpha_tag}_c{args.num_clients}_"
-        f"min{args.min_require_size}_ps{partition_seed}.npz",
-    )
-
-
-def _save_partition_cache(cache_file, client_indices):
-    """Save only client-to-global-feature index mappings (no feature copies)."""
-    payload = {
-        f"client_{k}": np.asarray(indices, dtype=np.int64)
-        for k, indices in enumerate(client_indices)
-    }
-    payload["num_clients"] = np.asarray([len(client_indices)], dtype=np.int64)
-    tmp_cache_file = f"{cache_file}.tmp.{os.getpid()}.npz"
-    np.savez(tmp_cache_file, **payload)
-    os.replace(tmp_cache_file, cache_file)
-
-
-def _load_partition_cache(cache_file, expected_num_clients):
-    print(f"Loading cached partition indices from {cache_file}")
-    data = np.load(cache_file, allow_pickle=False)
-    stored_num_clients = int(np.asarray(data["num_clients"]).reshape(-1)[0])
-    if stored_num_clients != expected_num_clients:
-        raise ValueError(
-            f"Partition cache {cache_file} has {stored_num_clients} clients; "
-            f"expected {expected_num_clients}")
-    return [
-        np.asarray(data[f"client_{k}"], dtype=np.int64)
-        for k in range(stored_num_clients)
-    ]
-
-
-def _combined_cache_paths(cache_dir, args, pretrained_tag, partition_seed):
-    """Return current/legacy combined caches, preferring the exact partition."""
-    backbone_tag = args.backbone.replace("/", "_")
-    exact = [
-        os.path.join(
-            cache_dir,
-            f"{backbone_tag}_{pretrained_tag}_alpha{args.alpha}_"
-            f"c{args.num_clients}_ps{partition_seed}.npz"),
-        os.path.join(
-            cache_dir,
-            f"{backbone_tag}_{pretrained_tag}_alpha{args.alpha}_"
-            f"c{args.num_clients}_s{partition_seed}.npz"),
-    ]
-    pattern = os.path.join(cache_dir, f"{backbone_tag}_{pretrained_tag}_alpha*_c*_*.npz")
-    return list(dict.fromkeys(exact + sorted(glob.glob(pattern))))
-
-
-def _client_data_from_indices(train_features, train_labels, client_indices):
-    return [
-        (train_features[indices], train_labels[indices])
-        for indices in client_indices
-    ]
 
 
 def _acquire_cache_lock(cache_file):
@@ -476,35 +495,43 @@ def _release_cache_lock(lock_file, fd):
     except FileNotFoundError:
         pass
 
-def _get_or_extract_seed_dependent_features(args):
+def _feature_cache_file(args, identity=None):
+    identity = identity or resolve_pretrained_identity(args.backbone, args.pretrained)
+    cache_dir = os.path.join(args.data_dir, f"{args.dataset}_clip_cache")
+    pretrained_tag = os.path.basename(identity["pretrained"]).replace(" ", "_")
+    partition_seed = getattr(args, "partition_seed", args.seed)
+    backbone_tag = args.backbone.replace("/", "_")
+    min_require_size = int(getattr(args, "min_require_size", 0))
+    checkpoint_tag = identity["checkpoint_hash"][:12]
+    partition_tag = _partition_scheme(args)
+    return os.path.join(
+        cache_dir,
+        f"{backbone_tag}_{pretrained_tag}_{checkpoint_tag}_minpc{min_require_size}_"
+        f"{partition_tag}_"
+        f"alpha{args.alpha}_c{args.num_clients}_ps{partition_seed}.npz",
+    )
+
+
+def get_or_extract_features(args):
     """
     Load cached features or extract them. Returns:
         client_data: list of (features_np, labels_np) per client
         test_features: torch.Tensor
         test_labels: torch.Tensor
     """
-    cache_dir = os.path.join(args.data_dir, f"{args.dataset}_clip_cache")
+    identity = resolve_pretrained_identity(args.backbone, args.pretrained)
+    cache_file = _feature_cache_file(args, identity)
+    cache_dir = os.path.dirname(cache_file)
     os.makedirs(cache_dir, exist_ok=True)
-    pretrained_tag = os.path.basename(args.pretrained).replace(" ", "_")
     partition_seed = getattr(args, "partition_seed", args.seed)
-    cache_file = os.path.join(cache_dir,
-        f"{args.backbone.replace('/', '_')}_{pretrained_tag}_alpha{args.alpha}_c{args.num_clients}_ps{partition_seed}.npz")
-    legacy_cache_file = os.path.join(cache_dir,
-        f"{args.backbone.replace(chr(47), chr(95))}_{pretrained_tag}_alpha{args.alpha}_c{args.num_clients}_s{partition_seed}.npz")
-    if not os.path.exists(cache_file) and os.path.exists(legacy_cache_file):
-        cache_file = legacy_cache_file
 
     if os.path.exists(cache_file):
-        args.feature_cache_file = cache_file
-        args.partition_cache_file = cache_file
-        return _load_feature_cache(cache_file, args)
+        return _load_feature_cache(cache_file, args, identity)
 
     lock_file, lock_fd = _acquire_cache_lock(cache_file)
     try:
         if os.path.exists(cache_file):
-            args.feature_cache_file = cache_file
-            args.partition_cache_file = cache_file
-            return _load_feature_cache(cache_file, args)
+            return _load_feature_cache(cache_file, args, identity)
 
         print("Extracting CLIP features (this may take a while)...")
         raw_data = load_raw_dataset(args.dataset, args.data_dir, args.alpha, partition_seed)
@@ -523,19 +550,30 @@ def _get_or_extract_seed_dependent_features(args):
         args.test_domain_names = test_domain_names
 
         train_features = extract_clip_features(
-            train_images, args.backbone, args.pretrained, args.device)
+            train_images, args.backbone, args.pretrained, args.device,
+            identity=identity)
         test_features_np = extract_clip_features(
-            test_images, args.backbone, args.pretrained, args.device)
+            test_images, args.backbone, args.pretrained, args.device,
+            identity=identity)
+        feature_dim = resolve_feature_dim(None, train_features, test_features_np)
 
         # Partition
         if client_indices is None:
             client_indices = dirichlet_partition(
                 train_labels, args.num_clients, args.alpha,
-                args.num_classes, args.min_require_size, partition_seed)
+                args.num_classes,
+                min_require_size=int(getattr(args, "min_require_size", 0)),
+                seed=partition_seed)
+
+        metadata = _expected_cache_metadata(args, identity)
+        metadata["feature_dim"] = feature_dim
+        metadata["pretrained"] = identity["pretrained"]
+        metadata["source"] = identity["source"]
 
         # Save cache atomically so parallel runs sharing a partition do not corrupt it.
         tmp_cache_file = f"{cache_file}.tmp.{os.getpid()}.npz"
         np.savez(tmp_cache_file,
+                 metadata=np.array(json.dumps(metadata, sort_keys=True)),
                  train_features=train_features,
                  train_labels=train_labels,
                  test_features=test_features_np,
@@ -544,8 +582,8 @@ def _get_or_extract_seed_dependent_features(args):
                  test_domain_ids=(test_domain_ids if test_domain_ids is not None else np.array([], dtype=np.int64)),
                  test_domain_names=np.array(test_domain_names or [], dtype=object))
         os.replace(tmp_cache_file, cache_file)
-        args.feature_cache_file = cache_file
-        args.partition_cache_file = cache_file
+        args.feature_cache_file = os.path.realpath(cache_file)
+        args.backbone_identity = metadata
 
         # Print distribution
         print("\nClient data distribution:")
@@ -565,129 +603,3 @@ def _get_or_extract_seed_dependent_features(args):
         _release_cache_lock(lock_file, lock_fd)
 
     return client_data, test_features, test_labels_t
-
-
-def get_or_extract_features(args):
-    """
-    Load frozen features and apply a partition-specific index view.
-
-    CIFAR/TinyImageNet features are independent of the Dirichlet partition, so
-    they are stored once globally. PACS/OfficeHome retain a seed-dependent
-    combined cache because their train/test image split itself depends on the
-    partition seed.
-    """
-    if is_multi_domain_dataset(args.dataset):
-        return _get_or_extract_seed_dependent_features(args)
-
-    cache_dir = os.path.join(args.data_dir, f"{args.dataset}_clip_cache")
-    os.makedirs(cache_dir, exist_ok=True)
-    pretrained_tag = os.path.basename(args.pretrained).replace(" ", "_")
-    backbone_tag = args.backbone.replace("/", "_")
-    partition_seed = getattr(args, "partition_seed", args.seed)
-    global_cache_file = os.path.join(
-        cache_dir, f"{backbone_tag}_{pretrained_tag}_global_features.npz")
-    combined_candidates = _combined_cache_paths(
-        cache_dir, args, pretrained_tag, partition_seed)
-
-    if not os.path.exists(global_cache_file):
-        lock_file, lock_fd = _acquire_cache_lock(global_cache_file)
-        try:
-            if not os.path.exists(global_cache_file):
-                legacy_source = next(
-                    (path for path in combined_candidates if os.path.exists(path)),
-                    None)
-                if legacy_source is not None:
-                    # A hard link promotes an existing combined cache without
-                    # copying its large feature tensors. Extra legacy index
-                    # fields are ignored by the global-cache loader.
-                    print(
-                        f"Promoting existing feature cache to global cache: "
-                        f"{legacy_source}")
-                    try:
-                        os.link(legacy_source, global_cache_file)
-                    except FileExistsError:
-                        pass
-                else:
-                    print("Extracting global CLIP features (this may take a while)...")
-                    raw_data = load_raw_dataset(
-                        args.dataset, args.data_dir, args.alpha, partition_seed)
-                    if len(raw_data) != 4:
-                        raise ValueError(
-                            f"Expected a partition-independent dataset, got "
-                            f"{len(raw_data)} fields for {args.dataset}")
-                    train_images, train_labels, test_images, test_labels_np = raw_data
-                    train_features = extract_clip_features(
-                        train_images, args.backbone, args.pretrained, args.device)
-                    test_features_np = extract_clip_features(
-                        test_images, args.backbone, args.pretrained, args.device)
-                    tmp_cache_file = (
-                        f"{global_cache_file}.tmp.{os.getpid()}.npz")
-                    np.savez(
-                        tmp_cache_file,
-                        train_features=train_features,
-                        train_labels=train_labels,
-                        test_features=test_features_np,
-                        test_labels=test_labels_np,
-                    )
-                    os.replace(tmp_cache_file, global_cache_file)
-        finally:
-            _release_cache_lock(lock_file, lock_fd)
-
-    train_features, train_labels, test_features_np, test_labels_np = (
-        _load_global_feature_cache(global_cache_file))
-    args.feature_cache_file = global_cache_file
-    args.test_domain_ids = None
-    args.test_domain_names = None
-
-    partition_cache_file = _partition_cache_path(
-        cache_dir, args, partition_seed)
-    if not os.path.exists(partition_cache_file):
-        lock_file, lock_fd = _acquire_cache_lock(partition_cache_file)
-        try:
-            if not os.path.exists(partition_cache_file):
-                # Only the two exact current/legacy paths may provide indices
-                # for this partition. Other combined caches are valid feature
-                # sources but belong to different partition configurations.
-                exact_partition_sources = combined_candidates[:2]
-                legacy_partition_source = next(
-                    (path for path in exact_partition_sources
-                     if os.path.exists(path)),
-                    None)
-                client_indices = None
-                if legacy_partition_source is not None:
-                    legacy_data = np.load(
-                        legacy_partition_source, allow_pickle=True)
-                    if "client_indices" in legacy_data:
-                        client_indices = [
-                            np.asarray(indices, dtype=np.int64)
-                            for indices in legacy_data["client_indices"]
-                        ]
-                        print(
-                            f"Migrating partition indices from "
-                            f"{legacy_partition_source}")
-
-                expected_indices = dirichlet_partition(
-                    train_labels, args.num_clients, args.alpha,
-                    args.num_classes, args.min_require_size,
-                    partition_seed)
-                if client_indices is None or any(
-                    not np.array_equal(old, expected)
-                    for old, expected in zip(client_indices, expected_indices)
-                ) or len(client_indices) != len(expected_indices):
-                    if client_indices is not None:
-                        print(
-                            "Legacy partition indices do not match the current "
-                            "partition configuration; regenerating indices.")
-                    client_indices = expected_indices
-                _save_partition_cache(partition_cache_file, client_indices)
-        finally:
-            _release_cache_lock(lock_file, lock_fd)
-
-    client_indices = _load_partition_cache(
-        partition_cache_file, args.num_clients)
-    args.partition_cache_file = partition_cache_file
-    client_data = _client_data_from_indices(
-        train_features, train_labels, client_indices)
-    test_features = torch.from_numpy(test_features_np).float()
-    test_labels = torch.from_numpy(test_labels_np).long()
-    return client_data, test_features, test_labels

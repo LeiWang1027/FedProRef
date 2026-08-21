@@ -68,14 +68,32 @@ parser.add_argument(
     "--method",
     type=str,
     default="fedproref",
-    choices=["fedavg", "proto_aug", "proto_cal", "proto_sample", "fedproref", "direct_anchor_aug"],
-    help="临时覆盖训练方法: fedavg | proto_aug | proto_cal | proto_sample | fedproref | direct_anchor_aug"
+    choices=["fedavg", "proto_aug", "proto_cal", "proto_sample", "direct_anchor_aug", "fedproref"],
+    help="临时覆盖训练方法，包括 direct_anchor_aug matched control"
+)
+parser.add_argument(
+    "--backbone",
+    type=str,
+    default="ViT-B-16",
+    help="OpenCLIP 骨干名称，例如 ViT-B-16 或 RN50"
 )
 parser.add_argument(
     "--pretrained",
     type=str,
     default=None,
     help="临时覆盖 OpenCLIP 预训练权重路径或标签，例如 openai"
+)
+parser.add_argument(
+    "--feat_dim",
+    type=int,
+    default=None,
+    help="可选的特征维度断言；默认从提取特征自动推断"
+)
+parser.add_argument(
+    "--min_require_size",
+    type=int,
+    default=0,
+    help="Dirichlet 划分中每个 client-class 的最小样本数（0 或 1）"
 )
 parser.add_argument(
     "--seed",
@@ -139,15 +157,22 @@ DATASET        = cli_args.dataset if cli_args.dataset is not None else "cifar100
 DATA_DIR       = "./data"
 NUM_CLIENTS    = 4 if DATASET in {"pacs", "officehome"} else 10
 ALPHA          = cli_args.alpha if cli_args.alpha is not None else 0.01  # Dirichlet 浓度参数（越小越异构）
-MIN_REQUIRE_SIZE = 1                 # 每个客户端每个类至少需要的样本数
 MIN_SAMPLES_PER_CLASS = 10          # 每个客户端某类样本数低于此值则不上传该类统计信息
 
 # ══════════════════════════════════════════════════════════════════════
 #  骨干网络
 # ══════════════════════════════════════════════════════════════════════
-BACKBONE   = "ViT-B-16"             # OpenCLIP 模型名
-PRETRAINED = cli_args.pretrained if cli_args.pretrained is not None else "./pretrain_path/old_open_clip_model.safetensors"  # 预训练权重路径或标签
-FEAT_DIM   = 512                    # 特征维度
+BACKBONE = cli_args.backbone
+PRETRAINED = cli_args.pretrained
+if PRETRAINED is None:
+    if BACKBONE == "RN50":
+        PRETRAINED = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "pretrain_path", "RN50_openai.pt")
+    else:
+        PRETRAINED = "./pretrain_path/old_open_clip_model.safetensors"
+FEAT_DIM = cli_args.feat_dim         # None 表示从实际特征自动推断
+MIN_REQUIRE_SIZE = cli_args.min_require_size
 
 # ══════════════════════════════════════════════════════════════════════
 #  分类头
@@ -223,7 +248,7 @@ CAL_LR        = 1e-3                # 校准学习率
 # ══════════════════════════════════════════════════════════════════════
 #  方法选择（消融实验）
 # ══════════════════════════════════════════════════════════════════════
-METHOD = cli_args.method            # fedavg | proto_aug | proto_cal | proto_sample | fedproref
+METHOD = cli_args.method            # 包括 direct_anchor_aug 和 fedproref
 
 # ══════════════════════════════════════════════════════════════════════
 #  杂项
@@ -258,13 +283,20 @@ rng = random.SystemRandom()
 best_accs = []
 
 print("=" * 60)
-print(f"FedProRef  dataset={DATASET}  alpha={ALPHA}  method={METHOD}  repeats={REPEATS}")
+print(
+    f"FedProRef  dataset={DATASET}  alpha={ALPHA}  method={METHOD}  "
+    f"backbone={BACKBONE}  min_require_size={MIN_REQUIRE_SIZE}  repeats={REPEATS}"
+)
 print("=" * 60)
 
 for run_idx in range(1, REPEATS + 1):
     seed = cli_args.seed + run_idx - 1 #rng.randint(1, 2**31 - 1)
     tag_part = f"_{cli_args.tag}" if cli_args.tag else ""
-    run_exp_name = f"{EXP_NAME}_{METHOD}_{DATASET}_a{ALPHA}{tag_part}_run{run_idx}"
+    backbone_tag = re.sub(r"[^A-Za-z0-9]+", "-", BACKBONE).strip("-").lower()
+    run_exp_name = (
+        f"{EXP_NAME}_{METHOD}_{DATASET}_{backbone_tag}_a{ALPHA}_"
+        f"minpc{MIN_REQUIRE_SIZE}{tag_part}_run{run_idx}"
+    )
     print(f"\n[{run_idx}/{REPEATS}] 开始  seed={seed}  exp={run_exp_name}")
 
     cmd = [
@@ -277,7 +309,7 @@ for run_idx in range(1, REPEATS + 1):
         "--min_samples_per_class",    str(MIN_SAMPLES_PER_CLASS),
         "--backbone",                 BACKBONE,
         "--pretrained",               PRETRAINED,
-        "--feat_dim",                 str(FEAT_DIM),
+        *([] if FEAT_DIM is None else ["--feat_dim", str(FEAT_DIM)]),
         "--head_type",                HEAD_TYPE,
         "--head_hidden",              str(HEAD_HIDDEN),
         "--comm_rounds",              str(COMM_ROUNDS),

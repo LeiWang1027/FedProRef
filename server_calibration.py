@@ -376,6 +376,7 @@ def generate_calibration_features(
     gen_per_class: int,
     proposal_sigma: float,
     device: str,
+    feat_dim: int,
     use_refiner: bool = True,
 ) -> tuple:
     """
@@ -413,7 +414,8 @@ def generate_calibration_features(
             all_labels.append(labels_c.cpu())
 
     if len(all_feats) == 0:
-        return torch.empty(0, 512), torch.empty(0, dtype=torch.long)
+        return (torch.empty((0, feat_dim), dtype=torch.float32),
+                torch.empty(0, dtype=torch.long))
 
     features = torch.cat(all_feats, dim=0)
     labels = torch.cat(all_labels, dim=0)
@@ -483,6 +485,7 @@ def generate_weak_class_features(
     aug_gen_per_class: int,
     proposal_sigma: float,
     device: str,
+    feat_dim: int,
     weak_percentile: float = 0.0,
     use_refiner: bool = True,   # False → 仅高斯采样，不使用 refiner（proto_aug 用）
     feature_generator=None,
@@ -528,15 +531,17 @@ def generate_weak_class_features(
                 weak_protos[c][m] = global_prototypes[c][m]
 
     if len(weak_protos) == 0:
-        return torch.empty(0, dtype=torch.float32), torch.empty(0, dtype=torch.long)
+        return (torch.empty((0, feat_dim), dtype=torch.float32),
+                torch.empty(0, dtype=torch.long))
 
-    if feature_generator is None:
-        # 每个弱类总计生成 aug_gen_per_class 个样本，按全局原型簇分摊。
-        aug_feats, aug_labels = generate_calibration_features(
-            refiner if use_refiner else None, weak_protos, num_classes,
-            aug_gen_per_class, proposal_sigma, device, use_refiner=use_refiner)
-    else:
-        aug_feats, aug_labels = feature_generator(weak_protos)
+    if feature_generator is not None:
+        return feature_generator(weak_protos)
+
+    # 生成合成特征（每个弱类总计生成 aug_gen_per_class 个样本，按全局原型簇分摊）
+    aug_feats, aug_labels = generate_calibration_features(
+        refiner if use_refiner else None, weak_protos, num_classes,
+        aug_gen_per_class, proposal_sigma, device, feat_dim,
+        use_refiner=use_refiner)
 
     return aug_feats, aug_labels  # already on CPU
 
@@ -584,7 +589,8 @@ def client_calibrate_with_refiner(
 
     gen_feats, gen_labels = generate_calibration_features(
         refiner, local_protos, args.num_classes,
-        args.gen_per_class, args.proposal_sigma, device, use_refiner=True)
+        args.gen_per_class, args.proposal_sigma, device, args.feat_dim,
+        use_refiner=True)
 
     sel_feats, sel_labels = budget_select(
         gen_feats, gen_labels, args.cal_budget, args.num_classes)
@@ -652,12 +658,14 @@ def server_calibration_pipeline(
     if use_refiner:
         gen_feats, gen_labels = generate_calibration_features(
             refiner, all_prototypes, args.num_classes,
-            args.gen_per_class, args.proposal_sigma, device, use_refiner=True)
+            args.gen_per_class, args.proposal_sigma, device, args.feat_dim,
+            use_refiner=True)
     else:
         # No refiner — just use proposal samples
         gen_feats, gen_labels = generate_calibration_features(
             None, all_prototypes, args.num_classes,
-            args.gen_per_class, args.proposal_sigma, device, use_refiner=False)
+            args.gen_per_class, args.proposal_sigma, device, args.feat_dim,
+            use_refiner=False)
 
     # ── Step 4: Budget select ──
     sel_feats, sel_labels = budget_select(

@@ -21,7 +21,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
 
-PYTHON_BIN="${PYTHON_BIN:-/home/cherry/miniconda3/envs/fedfm/bin/python}"
+PYTHON_BIN="${PYTHON_BIN:-python}"
 read -r -a DATASETS_ARRAY <<< "${DATASETS:-cifar10 cifar100 tinyimagenet}"
 read -r -a ALPHAS_ARRAY <<< "${ALPHAS:-0.01 0.03 0.05 0.07 0.09 0.1 0.3 0.5}"
 

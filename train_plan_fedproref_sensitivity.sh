@@ -22,7 +22,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
 
-PYTHON_BIN="${PYTHON_BIN:-/home/cherry/miniconda3/envs/fedfm/bin/python}"
+PYTHON_BIN="${PYTHON_BIN:-python}"
 DATASETS=(cifar100)
 ALPHAS=(0.01)
 

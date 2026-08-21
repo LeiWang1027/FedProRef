@@ -21,7 +21,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-export PYTHON_BIN="${PYTHON_BIN:-/home/cherry/miniconda3/envs/fedfm/bin/python}"
+export PYTHON_BIN="${PYTHON_BIN:-python}"
 export DATASETS="cifar100"
 export ALPHAS="0.01"
 export METHODS="proto_aug fedproref"

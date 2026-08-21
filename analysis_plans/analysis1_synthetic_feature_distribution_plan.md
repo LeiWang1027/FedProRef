@@ -207,7 +207,7 @@ analysis_scripts/analysis1_synthetic_feature_distribution.py
 Suggested command:
 
 ```bash
-/home/cherry/miniconda3/envs/fedfm/bin/python analysis_scripts/analysis1_synthetic_feature_distribution.py \
+python analysis_scripts/analysis1_synthetic_feature_distribution.py \
   --dataset cifar100 \
   --alpha 0.01 \
   --seed 42 \
@@ -272,7 +272,7 @@ Therefore the current workspace still cannot compute the requested metrics until
 Audit-only command already tested:
 
 ```bash
-/home/cherry/miniconda3/envs/fedfm/bin/python analysis_scripts/analysis1_synthetic_feature_distribution.py \
+python analysis_scripts/analysis1_synthetic_feature_distribution.py \
   --dataset cifar100 \
   --alpha 0.01 \
   --seed 42 \
@@ -291,7 +291,7 @@ It correctly stopped without metrics because the merged prototype pool is missin
 After rerunning the exact main setting with the updated code, use the combined artifact path:
 
 ```bash
-/home/cherry/miniconda3/envs/fedfm/bin/python analysis_scripts/analysis1_synthetic_feature_distribution.py \
+python analysis_scripts/analysis1_synthetic_feature_distribution.py \
   --dataset cifar100 \
   --alpha 0.01 \
   --seed 42 \

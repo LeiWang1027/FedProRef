@@ -1,0 +1,11 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite the corresponding FedProRef article."
+title: "FedProRef: Communication-Efficient Prototype-Count Supervision for Federated Learning Under Severe Label Skew"
+type: software
+authors:
+  - family-names: Wang
+    given-names: Lei
+  - family-names: Ren
+    given-names: Hao
+repository-code: "https://github.com/LeiWang1027/FedProRef"
+date-released: 2026-08-21

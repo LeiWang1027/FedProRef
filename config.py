@@ -17,7 +17,8 @@ def get_args():
                         help="Selected clients per communication round; default uses all clients")
     parser.add_argument("--alpha", type=float, default=0.1,
                         help="Dirichlet concentration (smaller = more heterogeneous)")
-    parser.add_argument("--min_require_size", type=int, default=2)
+    parser.add_argument("--min_require_size", type=int, default=0,
+                        help="Minimum samples per client-class cell (0 permits missing classes)")
     parser.add_argument("--min_samples_per_class", type=int, default=10,
                         help="Skip class stats upload if client has fewer than N samples of that class")
 
@@ -26,7 +27,8 @@ def get_args():
                         help="OpenCLIP model name")
     parser.add_argument("--pretrained", type=str, default="openai",
                         help="Pretrained weights tag or local path")
-    parser.add_argument("--feat_dim", type=int, default=512)
+    parser.add_argument("--feat_dim", type=int, default=None,
+                        help="Optional expected feature dimension; inferred when omitted")
 
     # ── Head ─────────────────────────────────────────────────────────
     parser.add_argument("--head_type", type=str, default="linear",
@@ -111,12 +113,6 @@ def get_args():
     parser.add_argument("--weak_class_percentile", type=float, default=0.0,
                         help="Bottom X%% of classes (by sample count) are also treated as weak. "
                              "0=disabled. E.g. 20 means the 20%% least-represented classes trigger synthesis.")
-    parser.add_argument("--mechanism_eval_start_round", type=int, default=1,
-                        help="First round (inclusive) for local weak-class mechanism evaluation")
-    parser.add_argument("--mechanism_eval_end_round", type=int, default=0,
-                        help="Last round (inclusive) for mechanism evaluation; 0 uses comm_rounds")
-    parser.add_argument("--mechanism_save_per_class", action="store_true",
-                        help="Save per-class before/after recall vectors in mechanism artifacts")
 
 
     parser.add_argument("--cal_budget", type=int, default=500,
@@ -126,7 +122,8 @@ def get_args():
 
     # ── Method ablation switches ─────────────────────────────────────
     parser.add_argument("--method", type=str, default="fedproref",
-                        choices=["fedavg", "proto_aug", "proto_cal", "proto_sample", "fedproref", "direct_anchor_aug"],
+                        choices=["fedavg", "proto_aug", "direct_anchor_aug",
+                                 "proto_cal", "proto_sample", "fedproref"],
                         help="Which method to run (for ablation)")
 
     # ── Misc ─────────────────────────────────────────────────────────
@@ -139,15 +136,11 @@ def get_args():
     parser.add_argument("--exp_name", type=str, default="default")
 
     args = parser.parse_args()
-    if args.mechanism_eval_start_round < 1:
-        parser.error("--mechanism_eval_start_round must be >= 1")
-    mechanism_end = args.mechanism_eval_end_round or args.comm_rounds
-    if mechanism_end < args.mechanism_eval_start_round:
-        parser.error("mechanism evaluation end round must be >= start round")
-    if mechanism_end > args.comm_rounds:
-        parser.error("mechanism evaluation end round cannot exceed comm_rounds")
 
-
+    if args.min_require_size < 0:
+        parser.error("--min_require_size must be nonnegative")
+    if args.feat_dim is not None and args.feat_dim <= 0:
+        parser.error("--feat_dim must be positive when provided")
 
     if args.device == "auto":
         import torch

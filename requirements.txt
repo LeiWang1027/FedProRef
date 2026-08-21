@@ -1,0 +1,8 @@
+numpy
+torch
+torchvision
+open_clip_torch==3.3.0
+scikit-learn
+Pillow
+matplotlib
+openpyxl

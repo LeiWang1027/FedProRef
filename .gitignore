@@ -1,5 +1,7 @@
 __pycache__/
 *.py[cod]
+.DS_Store
+Thumbs.db
 
 .history/
 .vscode/
@@ -8,7 +10,9 @@ data/
 logs/
 checkpoints/
 results/
+summary/
 pretrain_path/
+docs/superpowers/
 
 *.pth
 *.pt
@@ -19,6 +23,7 @@ pretrain_path/
 *.tar.gz
 *.zip
 *.7z
+*.xlsx
 
 *.aux
 *.bbl
